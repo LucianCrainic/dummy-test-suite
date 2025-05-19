@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""
+Kubernetes Test Runner
+
+This script runs in a Kubernetes pod and:
+1. Fetches a test from the control node API
+2. Executes the test
+3. Reports the result back to the control node
+4. Repeats until no more tests are available
+
+Usage:
+    python k8s_test_runner.py
+"""
+
+import os
+import sys
+import time
+import json
+import socket
+import subprocess
+import requests
+import uuid
+from datetime import datetime
+
+# Configuration - These are set via environment variables in the pod
+API_BASE_URL = os.environ.get('API_BASE_URL', 'http://localhost:8000')
+NODE_ID = os.environ.get('NODE_ID', socket.gethostname())
+TESTS_DIR = os.environ.get('TESTS_DIR', '/tests')
+RESULTS_DIR = os.environ.get('RESULTS_DIR', '/results')
+
+def get_next_test():
+    """Get the next test to run from the API."""
+    try:
+        response = requests.get(f"{API_BASE_URL}/api/next_test?node_id={NODE_ID}")
+        
+        if response.status_code == 200:
+            return response.json()
+        elif response.status_code == 404:
+            # No more tests
+            return None
+        else:
+            print(f"Error getting next test: {response.status_code}")
+            return None
+    except requests.RequestException as e:
+        print(f"Request exception: {e}")
+        return None
+
+def run_test(test):
+    """Run a Robot Framework test and return the result."""
+    execution_id = test['execution_id']
+    test_name = test['test_name']
+    file_path = test.get('file_path', '')
+    
+    print(f"Running test: {test_name} (Execution ID: {execution_id})")
+    
+    # Create a unique directory for this test run
+    output_dir = os.path.join(RESULTS_DIR, execution_id)
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Build the robot command
+    cmd = [
+        "robot",
+        "--outputdir", output_dir,
+        "--xunit", "xunit.xml",
+        "--log", "log.html",
+        "--report", "report.html",
+        "--output", "output.xml",
+        "--test", test_name,
+        TESTS_DIR
+    ]
+    
+    # Run the test
+    start_time = datetime.now()
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False  # Don't raise exception on test failure
+        )
+        
+        # Determine test status
+        status = "completed" if result.returncode == 0 else "failed"
+        
+        # Extract results from the output XML if available
+        result_info = {
+            "status": status,
+            "returncode": result.returncode,
+            "stdout": result.stdout[:1000],  # Limit output size
+            "stderr": result.stderr[:1000],
+            "execution_time": str(datetime.now() - start_time)
+        }
+        
+        return status, json.dumps(result_info)
+    
+    except Exception as e:
+        print(f"Error running test: {e}")
+        return "failed", json.dumps({"error": str(e)})
+
+def update_test_status(execution_id, status, result):
+    """Update the test status in the API."""
+    try:
+        data = {
+            "execution_id": execution_id,
+            "status": status,
+            "result": result
+        }
+        
+        response = requests.post(
+            f"{API_BASE_URL}/api/update_test",
+            json=data
+        )
+        
+        if response.status_code != 200:
+            print(f"Error updating test status: {response.status_code}")
+        
+        return response.status_code == 200
+    
+    except requests.RequestException as e:
+        print(f"Request exception: {e}")
+        return False
+
+def main():
+    """Main function to run tests in a loop."""
+    print(f"Starting test runner on node: {NODE_ID}")
+    print(f"API URL: {API_BASE_URL}")
+    
+    tests_run = 0
+    
+    while True:
+        # Get the next test
+        test = get_next_test()
+        
+        if not test:
+            print("No more tests available or error fetching test")
+            break
+        
+        # Run the test
+        status, result = run_test(test)
+        
+        # Update the test status
+        update_test_status(test['execution_id'], status, result)
+        
+        tests_run += 1
+        print(f"Completed test {tests_run}: {test['test_name']} - {status}")
+        print("-" * 50)
+    
+    print(f"Test runner completed. Total tests run: {tests_run}")
+
+if __name__ == "__main__":
+    main()
