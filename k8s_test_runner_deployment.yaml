@@ -79,6 +79,10 @@ spec:
         hostPath:
           path: /tmp/robot-tests/results  # Path to store results on host
           type: DirectoryOrCreate
+      - name: shared-test-outputs
+        hostPath:
+          path: /tmp/robot-tests/shared-outputs  # Shared directory for all test output.xml files
+          type: DirectoryOrCreate
       containers:
       - name: runner
         image: dummy-test-suite:latest  # Your pre-built test image
@@ -94,6 +98,8 @@ spec:
           value: "/tests"
         - name: RESULTS_DIR
           value: "/results"
+        - name: SHARED_OUTPUTS_DIR
+          value: "/shared-outputs"
         volumeMounts:
         - name: test-runner-script
           mountPath: /app/k8s_test_runner.py
@@ -102,4 +108,6 @@ spec:
           mountPath: /tests
         - name: test-results
           mountPath: /results
+        - name: shared-test-outputs
+          mountPath: /shared-outputs
         command: ["python3", "/app/k8s_test_runner.py"]
