@@ -13,13 +13,11 @@ Usage:
 """
 
 import os
-import sys
-import time
 import json
 import socket
 import subprocess
 import requests
-import uuid
+import shutil
 from datetime import datetime
 
 # Configuration - These are set via environment variables in the pod
@@ -27,6 +25,7 @@ API_BASE_URL = os.environ.get('API_BASE_URL', 'http://localhost:8000')
 NODE_ID = os.environ.get('NODE_ID', socket.gethostname())
 TESTS_DIR = os.environ.get('TESTS_DIR', '/tests')
 RESULTS_DIR = os.environ.get('RESULTS_DIR', '/results')
+SHARED_OUTPUTS_DIR = os.environ.get('SHARED_OUTPUTS_DIR', '/shared-outputs')
 
 def get_next_test():
     """Get the next test to run from the API."""
@@ -57,6 +56,9 @@ def run_test(test):
     output_dir = os.path.join(RESULTS_DIR, execution_id)
     os.makedirs(output_dir, exist_ok=True)
     
+    # Ensure shared outputs directory exists
+    os.makedirs(SHARED_OUTPUTS_DIR, exist_ok=True)
+    
     # Build the robot command
     cmd = [
         "robot",
@@ -79,6 +81,23 @@ def run_test(test):
             check=False  # Don't raise exception on test failure
         )
         
+        # Copy output.xml to shared directory with unique name
+        output_xml_path = os.path.join(output_dir, "output.xml")
+        if os.path.exists(output_xml_path):
+            # Create a unique filename using execution_id and test_name
+            safe_test_name = "".join(c for c in test_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+            safe_test_name = safe_test_name.replace(' ', '_')
+            shared_output_filename = f"{execution_id}_{safe_test_name}_output.xml"
+            shared_output_path = os.path.join(SHARED_OUTPUTS_DIR, shared_output_filename)
+            
+            try:
+                shutil.copy2(output_xml_path, shared_output_path)
+                print(f"Copied output.xml to shared directory: {shared_output_filename}")
+            except Exception as e:
+                print(f"Warning: Failed to copy output.xml to shared directory: {e}")
+        else:
+            print(f"Warning: output.xml not found at {output_xml_path}")
+        
         # Determine test status
         status = "completed" if result.returncode == 0 else "failed"
         
@@ -88,7 +107,8 @@ def run_test(test):
             "returncode": result.returncode,
             "stdout": result.stdout[:1000],  # Limit output size
             "stderr": result.stderr[:1000],
-            "execution_time": str(datetime.now() - start_time)
+            "execution_time": str(datetime.now() - start_time),
+            "shared_output_file": shared_output_filename if os.path.exists(output_xml_path) else None
         }
         
         return status, json.dumps(result_info)
@@ -124,6 +144,9 @@ def main():
     """Main function to run tests in a loop."""
     print(f"Starting test runner on node: {NODE_ID}")
     print(f"API URL: {API_BASE_URL}")
+    print(f"Tests directory: {TESTS_DIR}")
+    print(f"Results directory: {RESULTS_DIR}")
+    print(f"Shared outputs directory: {SHARED_OUTPUTS_DIR}")
     
     tests_run = 0
     
@@ -146,6 +169,7 @@ def main():
         print("-" * 50)
     
     print(f"Test runner completed. Total tests run: {tests_run}")
+    print(f"All output.xml files have been stored in: {SHARED_OUTPUTS_DIR}")
 
 if __name__ == "__main__":
     main()
