@@ -36,12 +36,12 @@ The Robot Framework Parallel Test Suite is a Kubernetes-native solution for exec
 
 ```mermaid
 graph LR
-    A[Test Files] --> B[Parser]
-    B --> C[Database]
-    C --> D[API Server]
-    D --> E[Worker Pods]
-    E --> F[Results Merger]
-    F --> G[Final Reports]
+    A["Test Files"] --> B["Parser"]
+    B --> C["Database"]
+    C --> D["API Server"]
+    D --> E["Worker Pods"]
+    E --> F["Results Merger"]
+    F --> G["Final Reports"]
     
     style A fill:#e1f5fe
     style G fill:#e8f5e8

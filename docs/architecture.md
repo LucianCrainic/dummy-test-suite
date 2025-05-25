@@ -52,22 +52,22 @@ The system is designed to execute Robot Framework tests in parallel across multi
 
 ```mermaid
 graph TB
-    A[Test Files<br/>(.robot)] --> B[Parser<br/>parser.py]
-    B --> C[SQLite Database<br/>robot_tests.db]
+    A["Test Files<br/>(.robot)"] --> B["Parser<br/>parser.py"]
+    B --> C["SQLite Database<br/>robot_tests.db"]
     
-    C --> D[API Server<br/>server.py]
-    D --> E[Worker Pod 1<br/>worker.py]
-    D --> F[Worker Pod 2<br/>worker.py]
-    D --> G[Worker Pod N<br/>worker.py]
+    C --> D["API Server<br/>server.py"]
+    D --> E["Worker Pod 1<br/>worker.py"]
+    D --> F["Worker Pod 2<br/>worker.py"]
+    D --> G["Worker Pod N<br/>worker.py"]
     
-    E --> H[Shared Storage<br/>output.xml files]
+    E --> H["Shared Storage<br/>output.xml files"]
     F --> H
     G --> H
     
-    H --> I[Results Merger<br/>merger.py]
-    I --> J[Final Reports<br/>HTML/XML]
+    H --> I["Results Merger<br/>merger.py"]
+    I --> J["Final Reports<br/>HTML/XML"]
     
-    K[Deploy Script<br/>deploy.sh] --> L[Kubernetes<br/>Cluster]
+    K["Deploy Script<br/>deploy.sh"] --> L["Kubernetes<br/>Cluster"]
     L --> D
     L --> E
     L --> F
