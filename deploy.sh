@@ -91,27 +91,31 @@ fi
 if command -v minikube &> /dev/null && minikube status &> /dev/null; then
     print_header "Setting up minikube shared directories"
     
-    # Create host folders that will be mounted into pods
-    mkdir -p /tmp/robot-tests/tests
-    mkdir -p /tmp/robot-tests/results
-    mkdir -p /tmp/robot-tests/templates
+    # Create directories on minikube VM that will be mounted into pods
+    minikube ssh "sudo mkdir -p /tmp/robot-tests/tests"
+    minikube ssh "sudo mkdir -p /tmp/robot-tests/results"
+    minikube ssh "sudo mkdir -p /tmp/robot-tests/templates"
+    minikube ssh "sudo mkdir -p /tmp/robot-tests/shared-outputs"
     
-    # Copy test files to the shared directory
-    cp -r tests/* /tmp/robot-tests/tests/
+    # Copy test files to the minikube VM
+    print_header "Copying test files to minikube VM"
     
-    # Copy database, API server, and templates
-    cp robot_tests.db /tmp/robot-tests/
-    cp server.py /tmp/robot-tests/
+    # Create a temporary archive of test files
+    tar -czf /tmp/test-files.tar.gz tests/
     
-    # Ensure templates directory exists
-    if [ -d "templates" ] && [ -f "templates/dashboard.html" ]; then
-        cp -r templates /tmp/robot-tests/
-        echo "Dashboard template copied to /tmp/robot-tests/"
-    else
-        print_warning "Dashboard template not found. Visualization dashboard will not be available."
-    fi
+    # Copy the archive to minikube VM and extract it
+    minikube cp /tmp/test-files.tar.gz /tmp/test-files.tar.gz
+    minikube ssh "cd /tmp && sudo tar -xzf test-files.tar.gz && sudo cp -r tests/* /tmp/robot-tests/tests/ && sudo rm -f test-files.tar.gz || true"
     
-    echo "Files copied to /tmp/robot-tests/"
+    # Copy database and API server files
+    minikube cp robot_tests.db /tmp/robot_tests.db
+    minikube cp server.py /tmp/server.py
+    minikube ssh "sudo mv /tmp/robot_tests.db /tmp/robot-tests/ && sudo mv /tmp/server.py /tmp/robot-tests/"
+    
+    # Clean up local temp file without failing if permission denied
+    rm -f /tmp/test-files.tar.gz 2>/dev/null || true
+    
+    echo "Files copied to minikube VM at /tmp/robot-tests/"
 fi
 
 # Create namespace if it doesn't exist
@@ -171,15 +175,94 @@ if [ "$CLEANUP" = true ]; then
     print_header "Waiting for tests to complete before cleanup"
     echo "Press Ctrl+C to skip cleanup"
     
-    # Simple loop to wait for tests to complete
-    while true; do
-        running_pods=$(kubectl get pods -n robot-tests -l app=robot-test-runner --field-selector=status.phase=Running --no-headers | wc -l)
-        if [ "$running_pods" -eq 0 ]; then
+    # Wait for API pod to be ready
+    echo "Waiting for API pod to be ready..."
+    kubectl wait --for=condition=ready pod -l app=test-api -n robot-tests --timeout=120s
+    
+    # Make sure no other port forwards are running
+    echo "Killing any existing port-forward processes..."
+    pkill -f "kubectl port-forward" || true
+    sleep 2
+    
+    # Get API Pod name directly
+    API_POD_NAME=$(kubectl get pod -l app=test-api -n robot-tests -o jsonpath='{.items[0].metadata.name}')
+    if [ -z "$API_POD_NAME" ]; then
+        echo "Failed to find API pod"
+        exit 1
+    fi
+    
+    # Start port forwarding directly to the pod
+    echo "Setting up port forwarding directly to API pod $API_POD_NAME..."
+    kubectl port-forward pod/$API_POD_NAME 8000:8000 -n robot-tests > /dev/null 2>&1 &
+    PORT_FORWARD_PID=$!
+    
+    # Wait for port forwarding to be established
+    echo "Waiting for port forwarding to be established..."
+    attempt=0
+    max_attempts=15
+    while [ $attempt -lt $max_attempts ]; do
+        if curl -s http://localhost:8000/api/status > /dev/null; then
+            echo "Port forwarding established successfully"
             break
         fi
-        echo "Still running: $running_pods pods..."
-        sleep 10
+        attempt=$((attempt + 1))
+        echo "Attempt $attempt of $max_attempts - waiting for API to become available..."
+        sleep 2
     done
+    
+    if [ $attempt -eq $max_attempts ]; then
+        echo "Failed to establish port forwarding after $max_attempts attempts"
+        echo "Will use alternative approach to monitor test status"
+        kill $PORT_FORWARD_PID 2>/dev/null || true
+        
+        # Alternative approach: check worker pod status
+        echo "Monitoring worker pods status instead..."
+        while true; do
+            # Check if all tests are completed by looking at the worker pods
+            running_pods=$(kubectl get pods -n robot-tests -l app=robot-test-runner --no-headers | grep -v "CrashLoopBackOff" | wc -l)
+            if [ "$running_pods" -eq 0 ]; then
+                echo "All worker pods completed or are in CrashLoopBackOff state - tests finished"
+                break
+            fi
+            echo "Still $running_pods worker pods running..."
+            sleep 10
+        done
+        USE_ALT_MONITORING=true
+    else
+        USE_ALT_MONITORING=false
+    fi
+    
+    # Wait for all tests to complete
+    if [ "$USE_ALT_MONITORING" = false ]; then
+        echo "Monitoring test progress via API..."
+        while true; do
+            # Get test status from API
+            api_response=$(curl -s http://localhost:8000/api/status 2>/dev/null)
+            if [ $? -eq 0 ]; then
+                total_tests=$(echo "$api_response" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('total_tests', 0))" 2>/dev/null)
+                completed_count=$(echo "$api_response" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('status_counts', {}).get('completed', 0))" 2>/dev/null)
+                failed_count=$(echo "$api_response" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('status_counts', {}).get('failed', 0))" 2>/dev/null)
+                
+                if [ -n "$total_tests" ] && [ -n "$completed_count" ] && [ -n "$failed_count" ]; then
+                    processed_tests=$((completed_count + failed_count))
+                    if [ "$processed_tests" -ge "$total_tests" ] && [ "$total_tests" -gt 0 ]; then
+                        echo "All tests completed! Total: $total_tests, Completed: $completed_count, Failed: $failed_count"
+                        break
+                    else
+                        echo "Tests in progress: $processed_tests/$total_tests completed (Passed: $completed_count, Failed: $failed_count)"
+                    fi
+                else
+                    echo "Waiting for API to respond with test status..."
+                fi
+            else
+                echo "API connection lost, retrying..."
+            fi
+            sleep 5
+        done
+        
+        # Kill port forwarding
+        kill $PORT_FORWARD_PID 2>/dev/null || true
+    fi
     
     print_header "Cleaning up Kubernetes resources"
     kubectl delete -f worker-deployment.yaml -n robot-tests

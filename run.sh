@@ -3,8 +3,8 @@
 # Entry point script for running Robot Framework tests
 
 # Define paths
-TESTS_DIR="/tests"
-RESULTS_DIR="/results"
+TESTS_DIR="${TESTS_DIR:-./tests}"
+RESULTS_DIR="${RESULTS_DIR:-./results}"
 
 # Create results directory if it doesn't exist
 mkdir -p $RESULTS_DIR
