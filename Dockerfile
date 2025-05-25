@@ -20,21 +20,21 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt requests
 
 # Add k8s test runner if it exists
-COPY k8s_test_runner.py /app/k8s_test_runner.py
-RUN chmod +x /app/k8s_test_runner.py
+COPY worker.py /app/worker.py
+RUN chmod +x /app/worker.py
 
 # Copy test files and entry script
 COPY tests/ /tests/
-COPY run_tests.sh /app/
+COPY run.sh /app/
 
 # Make sure the entry script is executable
-RUN chmod +x /app/run_tests.sh
+RUN chmod +x /app/run.sh
 
 # Create a volume for test results
 VOLUME /results
 
-# Set the entry point - default to run_tests.sh but can be overridden
-ENTRYPOINT ["/app/run_tests.sh"]
+# Set the entry point - default to run.sh but can be overridden
+ENTRYPOINT ["/app/run.sh"]
 
 # Default command runs all tests
 CMD ["/tests"]
