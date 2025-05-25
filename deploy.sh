@@ -89,6 +89,14 @@ echo "  Cleanup after: $CLEANUP"
 echo "  Monitor only:  $MONITOR_ONLY"
 echo "  Simple log:    $SIMPLE_LOG"
 
+# Clean up any existing deployments before starting
+print_header "Cleaning up any existing deployments"
+pkill -f "kubectl port-forward" || true
+kubectl delete -f worker-deployment.yaml -n robot-tests --ignore-not-found=true
+kubectl delete pods -n robot-tests --all --force --grace-period=0 2>/dev/null || true
+kubectl delete namespace robot-tests --ignore-not-found=true
+sleep 5
+
 # Check if we need to build the Docker image
 print_header "Building Docker image"
 docker build -t dummy-test-suite:latest .
@@ -120,9 +128,19 @@ if command -v minikube &> /dev/null && minikube status &> /dev/null; then
     minikube ssh "cd /tmp && sudo tar -xzf test-files.tar.gz && sudo cp -r tests/* /tmp/robot-tests/tests/ && sudo rm -f test-files.tar.gz || true"
     
     # Copy database and API server files
+    # Remove any existing files or directories with the same names
+    minikube ssh "sudo rm -rf /tmp/robot-tests/robot_tests.db /tmp/robot-tests/server.py /tmp/robot_tests.db /tmp/server.py"
+    
+    # Copy and move files
     minikube cp robot_tests.db /tmp/robot_tests.db
     minikube cp server.py /tmp/server.py
-    minikube ssh "sudo mv /tmp/robot_tests.db /tmp/robot-tests/ && sudo mv /tmp/server.py /tmp/robot-tests/"
+    minikube ssh "sudo cp -f /tmp/robot_tests.db /tmp/robot-tests/ && sudo cp -f /tmp/server.py /tmp/robot-tests/"
+    
+    # Verify files are in the correct location
+    if ! minikube ssh "test -f /tmp/robot-tests/robot_tests.db && test -f /tmp/robot-tests/server.py"; then
+        print_error "Files not found in destination directory. Please check permissions and paths."
+        exit 1
+    fi
     
     # Clean up local temp file without failing if permission denied
     rm -f /tmp/test-files.tar.gz 2>/dev/null || true
@@ -144,43 +162,28 @@ kubectl scale deployment robot-test-runner --replicas=$REPLICAS -n robot-tests
 # If reset flag is set, call the API to reset test statuses
 if [ "$RESET" = true ]; then
     print_header "Resetting test statuses"
-    # Wait for API to be ready
-    echo "Waiting for API service to be ready..."
-    sleep 10
+    # Wait for API to be ready and forward port
+    kubectl port-forward service/test-api-service 8000:8000 -n robot-tests &
+    PORT_FORWARD_PID=$!
     
-    # Get the API service IP
-    API_IP=$(kubectl get service test-api-service -n robot-tests -o jsonpath='{.spec.clusterIP}')
+    # Wait for port forwarding to establish
+    sleep 5
     
-    if [ -n "$API_IP" ]; then
-        # Forward port to access the API
-        kubectl port-forward service/test-api-service 8000:8000 -n robot-tests &
-        PORT_FORWARD_PID=$!
-        
-        # Wait for port forwarding to be established
-        sleep 5
-        
-        # Call the reset API
-        curl -X POST http://localhost:8000/api/reset
-        
-        # Kill port forwarding
-        kill $PORT_FORWARD_PID
+    # Call the reset API
+    if curl -s -X POST http://localhost:8000/api/reset; then
+        echo "Tests reset successfully"
     else
-        print_warning "Could not get API service IP for reset"
+        print_warning "Failed to reset tests"
     fi
+    
+    # Kill port forwarding
+    kill $PORT_FORWARD_PID
 fi
 
 print_header "Tests are now running in Kubernetes"
-echo "To monitor test progress, run:"
-echo "  kubectl get pods -n robot-tests"
-echo "  kubectl logs -f deployment/robot-test-runner -n robot-tests"
-echo ""
-echo "To access the test visualization dashboard:"
-echo "  kubectl port-forward service/test-api-service 8000:8000 -n robot-tests"
+echo "To monitor test progress: kubectl get pods -n robot-tests"
+echo "To access dashboard: kubectl port-forward service/test-api-service 8000:8000 -n robot-tests"
 echo "Then visit: http://localhost:8000/"
-echo ""
-echo "For API access only:"
-echo "  kubectl port-forward service/test-api-service 8000:8000 -n robot-tests"
-echo "Then visit: http://localhost:8000/api/dashboard or http://localhost:8000/api/status"
 
 # Function to monitor tests without cleanup
 # Usage: monitor_tests [quiet_mode]
@@ -210,20 +213,26 @@ monitor_tests() {
     echo "Waiting for API pod to be ready..."
     kubectl wait --for=condition=ready pod -l app=test-api -n robot-tests --timeout=120s
     
-    # Make sure no other port forwards are running
-    echo "Killing any existing port-forward processes..."
-    pkill -f "kubectl port-forward" || true
-    sleep 2
-    
-    # Get API Pod name directly
-    API_POD_NAME=$(kubectl get pod -l app=test-api -n robot-tests -o jsonpath='{.items[0].metadata.name}')
-    if [ -z "$API_POD_NAME" ]; then
-        echo "Failed to find API pod"
+    if [ $? -ne 0 ]; then
+        print_error "Timed out waiting for API pod to be ready"
+        API_POD_NAME=$(kubectl get pods -n robot-tests -l app=test-api -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$API_POD_NAME" ]; then
+            kubectl logs $API_POD_NAME -n robot-tests
+        fi
         exit 1
     fi
     
-    # Start port forwarding directly to the pod
-    echo "Setting up port forwarding directly to API pod $API_POD_NAME..."
+    # Clean up and set up port forwarding
+    pkill -f "kubectl port-forward" || true
+    sleep 1
+    
+    # Get API Pod name and start port forwarding
+    API_POD_NAME=$(kubectl get pod -l app=test-api -n robot-tests -o jsonpath='{.items[0].metadata.name}')
+    if [ -z "$API_POD_NAME" ]; then
+        print_error "Failed to find API pod"
+        exit 1
+    fi
+    
     kubectl port-forward pod/$API_POD_NAME 8000:8000 -n robot-tests > /dev/null 2>&1 &
     PORT_FORWARD_PID=$!
     
@@ -291,21 +300,22 @@ for test in completed_tests:
     }
     
     # Wait for port forwarding to be established
-    echo "Waiting for port forwarding to be established..."
+    echo "Waiting for API to become available..."
     attempt=0
-    max_attempts=15
+    max_attempts=30
     while [ $attempt -lt $max_attempts ]; do
         if curl -s http://localhost:8000/api/status > /dev/null; then
-            echo "Port forwarding established successfully"
             break
         fi
         attempt=$((attempt + 1))
-        echo "Attempt $attempt of $max_attempts - waiting for API to become available..."
+        if [ $((attempt % 5)) -eq 0 ]; then
+            echo "Waiting for API... ($attempt/$max_attempts)"
+        fi
         sleep 2
     done
     
     if [ $attempt -eq $max_attempts ]; then
-        echo "Failed to establish port forwarding after $max_attempts attempts"
+        echo "Failed to connect to API after $max_attempts attempts"
         return 1
     fi
     
@@ -461,13 +471,10 @@ if [ "$CLEANUP" = true ]; then
     # If monitoring fails or is interrupted, fall back to checking pod status
     if [ $? -ne 0 ]; then
         echo "Monitoring via API failed, falling back to pod status monitoring..."
-        # Alternative approach: check worker pod status
-        echo "Monitoring worker pods status instead..."
         while true; do
-            # Check if all tests are completed by looking at the worker pods
             running_pods=$(kubectl get pods -n robot-tests -l app=robot-test-runner --no-headers | grep -v "CrashLoopBackOff" | wc -l)
             if [ "$running_pods" -eq 0 ]; then
-                echo "All worker pods completed or are in CrashLoopBackOff state - tests finished"
+                echo "All tests finished"
                 break
             fi
             echo "Still $running_pods worker pods running..."
@@ -479,8 +486,6 @@ if [ "$CLEANUP" = true ]; then
     
     print_header "Cleaning up Kubernetes resources"
     kubectl delete -f worker-deployment.yaml -n robot-tests
-    
-    echo "Cleanup complete."
 fi
 
 print_header "Done!"
