@@ -33,7 +33,8 @@ def get_next_test():
         response = requests.get(f"{API_BASE_URL}/api/next_test?node_id={NODE_ID}")
         
         if response.status_code == 200:
-            return response.json()
+            test_data = response.json()
+            return test_data
         elif response.status_code == 404:
             # No more tests
             return None
@@ -70,6 +71,8 @@ def run_test(test):
         TESTS_DIR
     ]
     
+    print(f"Robot command: {' '.join(cmd)}")
+    
     # Run the test
     start_time = datetime.now()
     try:
@@ -79,6 +82,8 @@ def run_test(test):
             text=True,
             check=False  # Don't raise exception on test failure
         )
+        
+        print(f"Robot command completed with return code: {result.returncode}")
         
         # Copy output.xml to shared directory with unique name
         output_xml_path = os.path.join(output_dir, "output.xml")
@@ -104,8 +109,6 @@ def run_test(test):
         result_info = {
             "status": status,
             "returncode": result.returncode,
-            "stdout": result.stdout[:1000],  # Limit output size
-            "stderr": result.stderr[:1000],
             "execution_time": str(datetime.now() - start_time),
             "shared_output_file": shared_output_filename if os.path.exists(output_xml_path) else None
         }
@@ -141,34 +144,42 @@ def update_test_status(execution_id, status, result):
 
 def main():
     """Main function to run tests in a loop."""
-    print(f"Starting test runner on node: {NODE_ID}")
-    print(f"API URL: {API_BASE_URL}")
-    print(f"Tests directory: {TESTS_DIR}")
-    print(f"Results directory: {RESULTS_DIR}")
-    print(f"Shared outputs directory: {SHARED_OUTPUTS_DIR}")
-    
-    tests_run = 0
-    
-    while True:
-        # Get the next test
-        test = get_next_test()
+    try:
+        print(f"Starting test runner on node: {NODE_ID}")
         
-        if not test:
-            print("No more tests available or error fetching test")
-            break
+        # Test connectivity first
+        print("Testing connectivity to API...")
+        try:
+            response = requests.get(f"{API_BASE_URL}/api/status", timeout=5)
+            print(f"API connectivity test - Status: {response.status_code}")
+        except Exception as e:
+            print(f"API connectivity test failed: {e}")
+            return
         
-        # Run the test
-        status, result = run_test(test)
+        tests_run = 0
         
-        # Update the test status
-        update_test_status(test['execution_id'], status, result)
+        while True:
+            # Get the next test
+            test = get_next_test()
+            
+            if not test:
+                print("No more tests available")
+                break
+            
+            # Run the test
+            status, result = run_test(test)
+            
+            # Update the test status
+            update_test_status(test['execution_id'], status, result)
+            
+            tests_run += 1
+            print(f"Completed test {tests_run}: {test['test_name']} - {status}")
         
-        tests_run += 1
-        print(f"Completed test {tests_run}: {test['test_name']} - {status}")
-        print("-" * 50)
-    
-    print(f"Test runner completed. Total tests run: {tests_run}")
-    print(f"All output.xml files have been stored in: {SHARED_OUTPUTS_DIR}")
+        print(f"Test runner completed. Total tests run: {tests_run}")
+    except Exception as e:
+        print(f"Exception in main(): {e}")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     main()
