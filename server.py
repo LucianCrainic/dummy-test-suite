@@ -40,53 +40,69 @@ def next_test():
     if not conn:
         return jsonify({"error": "Database not found"}), 500
     
+    # Begin a transaction to lock the database during this operation
+    conn.isolation_level = 'EXCLUSIVE'  # This starts a transaction and prevents other writes
     cursor = conn.cursor()
     
-    # Get the next pending test
-    cursor.execute('''
-    SELECT id, test_name, suite_name, file_path 
-    FROM test_cases 
-    WHERE status = "pending" 
-    ORDER BY id
-    LIMIT 1
-    ''')
-    
-    test = cursor.fetchone()
-    
-    if not test:
+    try:
+        # Begin an immediate transaction which acquires all necessary locks
+        cursor.execute('BEGIN IMMEDIATE TRANSACTION')
+        
+        # Get the next pending test
+        cursor.execute('''
+        SELECT id, test_name, suite_name, file_path 
+        FROM test_cases 
+        WHERE status = "pending" 
+        ORDER BY id
+        LIMIT 1
+        ''')
+        
+        test = cursor.fetchone()
+        
+        if not test:
+            conn.rollback()
+            conn.close()
+            return jsonify({"message": "No tests available"}), 404
+        
+        test_id = test['id']
+        
+        # Mark test as running - this will be part of the atomic transaction
+        cursor.execute('''
+        UPDATE test_cases 
+        SET status = "running" 
+        WHERE id = ?
+        ''', (test_id,))
+        
+        # Create execution record
+        execution_id = str(uuid.uuid4())
+        cursor.execute('''
+        INSERT INTO test_executions 
+        (execution_id, test_id, node_id, status, start_time) 
+        VALUES (?, ?, ?, "running", ?)
+        ''', (execution_id, test_id, node_id, datetime.now()))
+        
+        # Commit the transaction
+        conn.commit()
+        
+        response = {
+            "execution_id": execution_id,
+            "test_id": test_id,
+            "test_name": test['test_name'],
+            "suite_name": test['suite_name'],
+            "file_path": test['file_path']
+        }
+        
+        app.logger.info(f"Assigned test {test['test_name']} to node {node_id}")
+        return jsonify(response), 200
+        
+    except sqlite3.Error as e:
+        # Roll back transaction in case of error
+        conn.rollback()
+        app.logger.error(f"Database error in next_test: {e}")
+        return jsonify({"error": "Database error", "details": str(e)}), 500
+    finally:
+        # Always close the connection
         conn.close()
-        return jsonify({"message": "No tests available"}), 404
-    
-    test_id = test['id']
-    
-    # Mark test as running
-    cursor.execute('''
-    UPDATE test_cases 
-    SET status = "running" 
-    WHERE id = ?
-    ''', (test_id,))
-    
-    # Create execution record
-    execution_id = str(uuid.uuid4())
-    cursor.execute('''
-    INSERT INTO test_executions 
-    (execution_id, test_id, node_id, status, start_time) 
-    VALUES (?, ?, ?, "running", ?)
-    ''', (execution_id, test_id, node_id, datetime.now()))
-    
-    conn.commit()
-    conn.close()
-    
-    response = {
-        "execution_id": execution_id,
-        "test_id": test_id,
-        "test_name": test['test_name'],
-        "suite_name": test['suite_name'],
-        "file_path": test['file_path']
-    }
-    
-    app.logger.info(f"Assigned test {test['test_name']} to node {node_id}")
-    return jsonify(response), 200
 
 @app.route('/api/update_test', methods=['POST'])
 def update_test():
@@ -104,42 +120,58 @@ def update_test():
     if not conn:
         return jsonify({"error": "Database not found"}), 500
     
+    # Use EXCLUSIVE isolation level for consistency with next_test
+    conn.isolation_level = 'EXCLUSIVE'
     cursor = conn.cursor()
     
-    # Get the test_id for this execution
-    cursor.execute('SELECT test_id FROM test_executions WHERE execution_id = ?', (execution_id,))
-    result_row = cursor.fetchone()
-    
-    if not result_row:
+    try:
+        # Begin a transaction
+        cursor.execute('BEGIN IMMEDIATE TRANSACTION')
+        
+        # Get the test_id for this execution
+        cursor.execute('SELECT test_id FROM test_executions WHERE execution_id = ?', (execution_id,))
+        result_row = cursor.fetchone()
+        
+        if not result_row:
+            conn.rollback()
+            conn.close()
+            return jsonify({"error": "Execution ID not found"}), 404
+        
+        test_id = result_row['test_id']
+        
+        # Update execution record
+        cursor.execute('''
+        UPDATE test_executions 
+        SET status = ?, end_time = ?, result = ? 
+        WHERE execution_id = ?
+        ''', (status, datetime.now(), result, execution_id))
+        
+        # Update test case status
+        cursor.execute('''
+        UPDATE test_cases 
+        SET status = ? 
+        WHERE id = ?
+        ''', (status, test_id))
+        
+        # Get the test name for logging
+        cursor.execute('SELECT test_name FROM test_cases WHERE id = ?', (test_id,))
+        test_row = cursor.fetchone()
+        test_name = test_row['test_name'] if test_row else 'Unknown test'
+        
+        # Commit the transaction
+        conn.commit()
+        
+        app.logger.info(f"Updated test {test_name} (ID: {test_id}) status to {status}")
+        return jsonify({"message": "Test status updated"}), 200
+        
+    except sqlite3.Error as e:
+        # Roll back transaction in case of error
+        conn.rollback()
+        app.logger.error(f"Database error in update_test: {e}")
+        return jsonify({"error": "Database error", "details": str(e)}), 500
+    finally:
+        # Always close the connection
         conn.close()
-        return jsonify({"error": "Execution ID not found"}), 404
-    
-    test_id = result_row['test_id']
-    
-    # Update execution record
-    cursor.execute('''
-    UPDATE test_executions 
-    SET status = ?, end_time = ?, result = ? 
-    WHERE execution_id = ?
-    ''', (status, datetime.now(), result, execution_id))
-    
-    # Update test case status
-    cursor.execute('''
-    UPDATE test_cases 
-    SET status = ? 
-    WHERE id = ?
-    ''', (status, test_id))
-    
-    # Get the test name for logging
-    cursor.execute('SELECT test_name FROM test_cases WHERE id = ?', (test_id,))
-    test_row = cursor.fetchone()
-    test_name = test_row['test_name'] if test_row else 'Unknown test'
-    
-    conn.commit()
-    conn.close()
-    
-    app.logger.info(f"Updated test {test_name} (ID: {test_id}) status to {status}")
-    return jsonify({"message": "Test status updated"}), 200
 
 @app.route('/api/status', methods=['GET'])
 def status():
@@ -201,15 +233,32 @@ def reset_tests():
     if not conn:
         return jsonify({"error": "Database not found"}), 500
     
+    # Use EXCLUSIVE isolation level for consistency
+    conn.isolation_level = 'EXCLUSIVE'
     cursor = conn.cursor()
-    cursor.execute('UPDATE test_cases SET status = "pending"')
-    conn.commit()
     
-    rowcount = cursor.rowcount
-    conn.close()
-    
-    app.logger.info(f"Reset {rowcount} tests to pending status")
-    return jsonify({"message": f"Reset {rowcount} tests to pending status"}), 200
+    try:
+        # Begin a transaction
+        cursor.execute('BEGIN IMMEDIATE TRANSACTION')
+        
+        # Reset test statuses to pending
+        cursor.execute('UPDATE test_cases SET status = "pending"')
+        rowcount = cursor.rowcount
+        
+        # Commit the transaction
+        conn.commit()
+        
+        app.logger.info(f"Reset {rowcount} tests to pending status")
+        return jsonify({"message": f"Reset {rowcount} tests to pending status"}), 200
+        
+    except sqlite3.Error as e:
+        # Roll back transaction in case of error
+        conn.rollback()
+        app.logger.error(f"Database error in reset_tests: {e}")
+        return jsonify({"error": "Database error", "details": str(e)}), 500
+    finally:
+        # Always close the connection
+        conn.close()
 
 @app.route('/', methods=['GET'])
 def dashboard():
