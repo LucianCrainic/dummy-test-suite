@@ -40,6 +40,7 @@ spec:
         volumeMounts:
         - name: test-data
           mountPath: /app
+          # Make sure files are visible
         workingDir: /app
         command: ["/bin/bash", "-c"]
         args:
@@ -49,7 +50,11 @@ spec:
           pip install flask requests
           mkdir -p templates
           echo "Starting API server..."
-          python server.py
+          # List files in /app to debug
+          echo "Available files in /app:"
+          ls -la /app
+          # Start the server with explicit path
+          python /app/server.py
 ---
 apiVersion: apps/v1
 kind: Deployment
