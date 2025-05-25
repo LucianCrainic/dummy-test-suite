@@ -45,8 +45,6 @@ fi
 REPLICAS=5
 RESET=false
 CLEANUP=false
-MONITOR_ONLY=false
-SIMPLE_LOG=false
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -65,17 +63,9 @@ while [[ $# -gt 0 ]]; do
             CLEANUP=true
             shift
             ;;
-        --monitor-only)
-            MONITOR_ONLY=true
-            shift
-            ;;
-        --simple-log)
-            SIMPLE_LOG=true
-            shift
-            ;;
         *)
             print_error "Unknown option: $1"
-            echo "Usage: $0 [--replicas N] [--reset] [--cleanup] [--monitor-only] [--simple-log]"
+            echo "Usage: $0 [--replicas N] [--reset] [--cleanup]"
             exit 1
             ;;
     esac
@@ -86,8 +76,6 @@ echo "Configuration:"
 echo "  Parallel pods: $REPLICAS"
 echo "  Reset tests:   $RESET"
 echo "  Cleanup after: $CLEANUP"
-echo "  Monitor only:  $MONITOR_ONLY"
-echo "  Simple log:    $SIMPLE_LOG"
 
 # Clean up any existing deployments before starting
 print_header "Cleaning up any existing deployments"
@@ -181,21 +169,10 @@ if [ "$RESET" = true ]; then
     kill $PORT_FORWARD_PID
 fi
 
-print_header "Tests are now running in Kubernetes"
-echo "To monitor test progress: kubectl get pods -n robot-tests"
-echo "To access dashboard: kubectl port-forward service/test-api-service 8000:8000 -n robot-tests"
-echo "Then visit: http://localhost:8000/"
-
-# Function to monitor tests without cleanup
-# Usage: monitor_tests [quiet_mode]
-# If quiet_mode is "quiet", less verbose output will be shown
+# Function to monitor tests and always create test execution log
 monitor_tests() {
-    local quiet_mode=${1:-""}
-    
-    if [ "$quiet_mode" != "quiet" ]; then
-        print_header "Monitoring test execution in real-time"
-        echo "Press Ctrl+C to stop monitoring"
-    fi
+    print_header "Monitoring test execution in real-time"
+    echo "Press Ctrl+C to stop monitoring"
     
     # Create a log file for test completions
     TEST_LOG_FILE="test_execution_log_$(date +%Y%m%d_%H%M%S).txt"
@@ -206,9 +183,7 @@ monitor_tests() {
     echo "----------------" >> "$TEST_LOG_FILE"
     echo "" >> "$TEST_LOG_FILE"
     
-    if [ "$quiet_mode" != "quiet" ]; then
-        echo "Recording all test completions to: $TEST_LOG_FILE"
-    fi
+    echo "Recording all test completions to: $TEST_LOG_FILE"
     
     # Wait for API pod to be ready
     echo "Waiting for API pod to be ready..."
@@ -241,7 +216,6 @@ monitor_tests() {
     get_recently_completed_tests() {
         local timestamp="$1"
         local api_response="$2"
-        local simple_format="$3"
         
         # Get list of recently completed and failed tests using Python with detailed info
         echo "$api_response" | python3 -c "
@@ -251,7 +225,6 @@ from datetime import datetime
 
 data = json.load(sys.stdin)
 timestamp = float('$timestamp')
-simple_format = '$simple_format' == 'true'
 
 # Extract completed and failed tests with timestamps
 completed_tests = []
@@ -286,12 +259,8 @@ for execution in recent_executions:
                     # Format the time in a readable format
                     time_str = datetime.fromtimestamp(test_time).strftime('%H:%M:%S')
                     
-                    if simple_format:
-                        # Simple format just shows status and name
-                        completed_tests.append(f'{status.upper()}: {suite_name}.{name}')
-                    else:
-                        # Create a detailed message for this test completion
-                        completed_tests.append(f'{status.upper()}: {suite_name}.{name} [ID: {execution_id}, Node: {node_id}, Time: {time_str}]')
+                    # Create a detailed message for this test completion
+                    completed_tests.append(f'{status.upper()}: {suite_name}.{name} [ID: {execution_id}, Node: {node_id}, Time: {time_str}]')
     except (ValueError, TypeError) as e:
         print(f'Error processing execution data: {e}', file=sys.stderr)
 
@@ -337,7 +306,7 @@ for test in completed_tests:
                 processed_tests=$((completed_count + failed_count))
                 
                 # Get any tests completed since our last check
-                recently_completed=$(get_recently_completed_tests "$last_check_timestamp" "$api_response" "$SIMPLE_LOG")
+                recently_completed=$(get_recently_completed_tests "$last_check_timestamp" "$api_response")
                 if [ -n "$recently_completed" ]; then
                     echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━ TEST COMPLETION LOG ━━━━━━━━━━━━━━━━━${NC}"
                     echo "$recently_completed" | while read -r test; do
@@ -374,7 +343,6 @@ import sys, json
 from datetime import datetime
 
 data = json.load(sys.stdin)
-simple_format = '$SIMPLE_LOG' == 'true'
 
 # Get all finished test executions
 status_counts = data.get('status_counts', {})
@@ -408,12 +376,9 @@ try:
                 suite_prefix = name.split('_')[0] if '_' in name else ''
                 suite_name = suite_prefix if suite_prefix else 'Unknown suite'
                 
-                if simple_format:
-                    all_test_data.append(f'{status.upper()}: {suite_name}.{name}')
-                else:
-                    execution_id = execution.get('execution_id', '?')
-                    end_time = execution.get('end_time', 'Unknown time')
-                    all_test_data.append(f'{status.upper()}: {suite_name}.{name} [ID: {execution_id}, Node: {node_id}]')
+                execution_id = execution.get('execution_id', '?')
+                end_time = execution.get('end_time', 'Unknown time')
+                all_test_data.append(f'{status.upper()}: {suite_name}.{name} [ID: {execution_id}, Node: {node_id}]')
     else:
         all_test_data.append('Failed to get complete test execution data from API')
 except Exception as e:
@@ -454,34 +419,17 @@ for test in all_test_data:
     kill $PORT_FORWARD_PID 2>/dev/null || true
 }
 
-# Check if we should only monitor
-if [ "$MONITOR_ONLY" = true ]; then
-    monitor_tests
-    exit 0
-fi
+print_header "Tests are now running in Kubernetes"
+echo "To monitor test progress: kubectl get pods -n robot-tests"
+echo "To access dashboard: kubectl port-forward service/test-api-service 8000:8000 -n robot-tests"
+echo "Then visit: http://localhost:8000/"
+
+# Always monitor tests and create test execution log
+monitor_tests
 
 # Check if we should wait and cleanup
 if [ "$CLEANUP" = true ]; then
-    print_header "Waiting for tests to complete before cleanup"
-    echo "Press Ctrl+C to skip cleanup"
-    
-    # Use our monitoring function to track test progress
-    # Use standard verbose mode for cleanup
-    monitor_tests
-    
-    # If monitoring fails or is interrupted, fall back to checking pod status
-    if [ $? -ne 0 ]; then
-        echo "Monitoring via API failed, falling back to pod status monitoring..."
-        while true; do
-            running_pods=$(kubectl get pods -n robot-tests -l app=robot-test-runner --no-headers | grep -v "CrashLoopBackOff" | wc -l)
-            if [ "$running_pods" -eq 0 ]; then
-                echo "All tests finished"
-                break
-            fi
-            echo "Still $running_pods worker pods running..."
-            sleep 10
-        done
-    fi
+    print_header "Running test result merger and cleanup"
     
     # Run test result merger
     print_header "Merging test results"
