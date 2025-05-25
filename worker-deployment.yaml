@@ -103,4 +103,4 @@ spec:
           mountPath: /results
         - name: shared-test-outputs
           mountPath: /shared-outputs
-        command: ["python3", "worker.py"]
+        command: ["python3", "/app/worker.py"]
