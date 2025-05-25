@@ -1,0 +1,106 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-api-service
+  namespace: robot-tests
+spec:
+  selector:
+    app: test-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-api
+  namespace: robot-tests
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-api
+  template:
+    metadata:
+      labels:
+        app: test-api
+    spec:
+      volumes:
+      - name: test-data
+        hostPath:
+          path: /tmp/robot-tests  # This would be your host path with test files and database
+          type: DirectoryOrCreate
+      containers:
+      - name: test-api
+        image: python:3.9-slim
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 8000
+        volumeMounts:
+        - name: test-data
+          mountPath: /app
+        workingDir: /app
+        command: ["/bin/bash", "-c"]
+        args:
+        - |
+          apt-get update
+          apt-get install -y sqlite3
+          pip install flask requests
+          mkdir -p templates
+          echo "Starting API server..."
+          python server.py
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robot-test-runner
+  namespace: robot-tests
+spec:
+  replicas: 5  # This will be scaled dynamically
+  selector:
+    matchLabels:
+      app: robot-test-runner
+  template:
+    metadata:
+      labels:
+        app: robot-test-runner
+    spec:
+      volumes:
+      - name: test-data
+        hostPath:
+          path: /tmp/robot-tests/tests  # Path to test files on host
+          type: DirectoryOrCreate
+      - name: test-results
+        hostPath:
+          path: /tmp/robot-tests/results  # Path to store results on host
+          type: DirectoryOrCreate
+      - name: shared-test-outputs
+        hostPath:
+          path: /tmp/robot-tests/shared-outputs  # Shared directory for all test output.xml files
+          type: DirectoryOrCreate
+      containers:
+      - name: runner
+        image: dummy-test-suite:latest  # Your pre-built test image
+        imagePullPolicy: Never  # This ensures it uses local image
+        env:
+        - name: API_BASE_URL
+          value: "http://test-api-service:8000"
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: TESTS_DIR
+          value: "/tests"
+        - name: RESULTS_DIR
+          value: "/results"
+        - name: SHARED_OUTPUTS_DIR
+          value: "/shared-outputs"
+        volumeMounts:
+        - name: test-data
+          mountPath: /tests
+        - name: test-results
+          mountPath: /results
+        - name: shared-test-outputs
+          mountPath: /shared-outputs
+        command: ["python3", "worker.py"]
