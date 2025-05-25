@@ -29,21 +29,45 @@ SHARED_OUTPUTS_DIR = os.environ.get('SHARED_OUTPUTS_DIR', '/shared-outputs')
 
 def get_next_test():
     """Get the next test to run from the API."""
-    try:
-        response = requests.get(f"{API_BASE_URL}/api/next_test?node_id={NODE_ID}")
-        
-        if response.status_code == 200:
-            test_data = response.json()
-            return test_data
-        elif response.status_code == 404:
-            # No more tests
-            return None
-        else:
-            print(f"Error getting next test: {response.status_code}")
-            return None
-    except requests.RequestException as e:
-        print(f"Request exception: {e}")
-        return None
+    max_retries = 3
+    retry_delay = 1  # seconds
+    
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(f"{API_BASE_URL}/api/next_test?node_id={NODE_ID}")
+            
+            if response.status_code == 200:
+                test_data = response.json()
+                return test_data
+            elif response.status_code == 404:
+                # No more tests
+                return None
+            elif response.status_code == 500 and "Database error" in response.text:
+                # This could be a transaction conflict - retry after a delay
+                print(f"Database error on attempt {attempt+1}/{max_retries}, retrying in {retry_delay} seconds...")
+                import time
+                time.sleep(retry_delay)
+                # Increase delay for next retry (exponential backoff)
+                retry_delay *= 2
+            else:
+                print(f"Error getting next test: {response.status_code}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying... (Attempt {attempt+1}/{max_retries})")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    return None
+        except requests.RequestException as e:
+            print(f"Request exception: {e}")
+            if attempt < max_retries - 1:
+                print(f"Retrying... (Attempt {attempt+1}/{max_retries})")
+                import time
+                time.sleep(retry_delay)
+                retry_delay *= 2
+            else:
+                return None
+    
+    return None
 
 def run_test(test):
     """Run a Robot Framework test and return the result."""
@@ -146,12 +170,23 @@ def main():
     """Main function to run tests in a loop."""
     try:
         print(f"Starting test runner on node: {NODE_ID}")
+        print(f"Using API URL: {API_BASE_URL}")
         
         # Test connectivity first
         print("Testing connectivity to API...")
         try:
             response = requests.get(f"{API_BASE_URL}/api/status", timeout=5)
             print(f"API connectivity test - Status: {response.status_code}")
+            
+            # Get information about how many tests are available
+            try:
+                status_data = response.json()
+                total_tests = status_data.get('total_tests', 'unknown')
+                pending_tests = status_data.get('status_counts', {}).get('pending', 'unknown')
+                print(f"API reports {pending_tests} pending tests out of {total_tests} total tests")
+            except Exception as e:
+                print(f"Could not parse API status response: {e}")
+                
         except Exception as e:
             print(f"API connectivity test failed: {e}")
             return
@@ -159,18 +194,27 @@ def main():
         tests_run = 0
         
         while True:
-            # Get the next test
+            # Get the next test with a timestamp to track time spent in test fetching
+            import time
+            start_time = time.time()
+            print(f"Requesting next test from API...")
             test = get_next_test()
+            request_time = time.time() - start_time
             
             if not test:
                 print("No more tests available")
                 break
             
+            print(f"Received test: {test['test_name']} (Took {request_time:.2f}s to fetch)")
+            print(f"Test details: ID={test['test_id']}, Execution ID={test['execution_id']}")
+            
             # Run the test
             status, result = run_test(test)
             
             # Update the test status
-            update_test_status(test['execution_id'], status, result)
+            update_success = update_test_status(test['execution_id'], status, result)
+            if not update_success:
+                print(f"WARNING: Failed to update status for test {test['test_name']} (ID: {test['test_id']})")
             
             tests_run += 1
             print(f"Completed test {tests_run}: {test['test_name']} - {status}")
