@@ -1,0 +1,4 @@
+robotframework==6.1.1
+requests==2.31.0
+flask==2.3.3
+robotframework-requests==0.9.5
