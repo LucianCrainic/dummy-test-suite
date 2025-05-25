@@ -127,17 +127,18 @@ if command -v minikube &> /dev/null && minikube status &> /dev/null; then
     minikube cp /tmp/test-files.tar.gz /tmp/test-files.tar.gz
     minikube ssh "cd /tmp && sudo tar -xzf test-files.tar.gz && sudo cp -r tests/* /tmp/robot-tests/tests/ && sudo rm -f test-files.tar.gz || true"
     
-    # Copy database and API server files
+    # Copy database, API server and merger files
     # Remove any existing files or directories with the same names
-    minikube ssh "sudo rm -rf /tmp/robot-tests/robot_tests.db /tmp/robot-tests/server.py /tmp/robot_tests.db /tmp/server.py"
+    minikube ssh "sudo rm -rf /tmp/robot-tests/robot_tests.db /tmp/robot-tests/server.py /tmp/robot-tests/merger.py /tmp/robot_tests.db /tmp/server.py /tmp/merger.py"
     
     # Copy and move files
     minikube cp robot_tests.db /tmp/robot_tests.db
     minikube cp server.py /tmp/server.py
-    minikube ssh "sudo cp -f /tmp/robot_tests.db /tmp/robot-tests/ && sudo cp -f /tmp/server.py /tmp/robot-tests/"
+    minikube cp merger.py /tmp/merger.py
+    minikube ssh "sudo cp -f /tmp/robot_tests.db /tmp/robot-tests/ && sudo cp -f /tmp/server.py /tmp/robot-tests/ && sudo cp -f /tmp/merger.py /tmp/robot-tests/"
     
     # Verify files are in the correct location
-    if ! minikube ssh "test -f /tmp/robot-tests/robot_tests.db && test -f /tmp/robot-tests/server.py"; then
+    if ! minikube ssh "test -f /tmp/robot-tests/robot_tests.db && test -f /tmp/robot-tests/server.py && test -f /tmp/robot-tests/merger.py"; then
         print_error "Files not found in destination directory. Please check permissions and paths."
         exit 1
     fi
@@ -482,9 +483,120 @@ if [ "$CLEANUP" = true ]; then
         done
     fi
     
-        # Cleanup section - handled by monitor_tests function above
+    # Run test result merger
+    print_header "Merging test results"
     
+    # Create a directory for merged results if it doesn't exist
+    minikube ssh "sudo mkdir -p /tmp/robot-tests/merged-results"
+    
+    # Run the merger.py script in a temporary pod
+    echo "Running merger script to combine test results..."
+    cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: Pod
+metadata:
+  name: test-merger
+  namespace: robot-tests
+spec:
+  volumes:
+  - name: robot-tests-volume
+    hostPath:
+      path: /tmp/robot-tests
+      type: DirectoryOrCreate
+  containers:
+  - name: merger
+    image: dummy-test-suite:latest
+    imagePullPolicy: Never
+    volumeMounts:
+    - name: robot-tests-volume
+      mountPath: /app
+    workingDir: /app
+    env:
+    - name: SHARED_OUTPUTS_DIR
+      value: "/app/shared-outputs"
+    - name: MERGED_RESULTS_DIR
+      value: "/app/merged-results"
+    - name: DATABASE_PATH
+      value: "/app/robot_tests.db"
+    command: ["python3", "/app/merger.py"]
+  restartPolicy: Never
+EOF
+
+    # Wait for a reasonable time for the merger to produce output (don't wait for completion status)
+    echo "Waiting for merger to produce output files..."
+    sleep 30
+    
+    # Show the merger logs regardless of exit status
+    echo "Merger logs:"
+    kubectl logs test-merger -n robot-tests
+    
+    # Check if the output files exist in the minikube VM
+    if minikube ssh "test -f /tmp/robot-tests/merged-results/merged_output.xml && test -f /tmp/robot-tests/merged-results/merged_log.html && test -f /tmp/robot-tests/merged-results/merged_report.html"; then
+        echo "✅ Merger output files found. Proceeding with copy."
+    else
+        echo "❌ Merger output files not found. Checking for errors:"
+        kubectl describe pod test-merger -n robot-tests
+        print_warning "Will attempt to copy files anyway, but they might not exist."
+    fi
+    
+    # Copy the merged results from minikube to local directory
+    echo "Copying merged results to local directory..."
+    mkdir -p ./merged-results
+    
+    # Use alternative approach to copy files with SSH and cat
+    echo "Using ssh method to copy files from minikube VM..."
+    
+    # Copy output.xml
+    if minikube ssh "test -f /tmp/robot-tests/merged-results/merged_output.xml"; then
+        echo "Copying merged_output.xml..."
+        minikube ssh "cat /tmp/robot-tests/merged-results/merged_output.xml" > ./merged-results/merged_output.xml
+        if [ $? -eq 0 ] && [ -s "./merged-results/merged_output.xml" ]; then
+            echo "✅ Successfully copied merged_output.xml"
+            # Copy directly to the root with the correct name
+            cp -f ./merged-results/merged_output.xml ./output.xml
+            echo "✅ output.xml saved to repo root"
+        else
+            print_warning "Failed to copy merged_output.xml"
+        fi
+    else
+        print_warning "merged_output.xml not found in minikube VM"
+    fi
+    
+    # Copy log.html
+    if minikube ssh "test -f /tmp/robot-tests/merged-results/merged_log.html"; then
+        echo "Copying merged_log.html..."
+        minikube ssh "cat /tmp/robot-tests/merged-results/merged_log.html" > ./merged-results/merged_log.html
+        if [ $? -eq 0 ] && [ -s "./merged-results/merged_log.html" ]; then
+            echo "✅ Successfully copied merged_log.html"
+            # Copy directly to the root with the correct name
+            cp -f ./merged-results/merged_log.html ./log.html
+            echo "✅ log.html saved to repo root"
+        else
+            print_warning "Failed to copy merged_log.html"
+        fi
+    else
+        print_warning "merged_log.html not found in minikube VM"
+    fi
+    
+    # Copy report.html
+    if minikube ssh "test -f /tmp/robot-tests/merged-results/merged_report.html"; then
+        echo "Copying merged_report.html..."
+        minikube ssh "cat /tmp/robot-tests/merged-results/merged_report.html" > ./merged-results/merged_report.html
+        if [ $? -eq 0 ] && [ -s "./merged-results/merged_report.html" ]; then
+            echo "✅ Successfully copied merged_report.html"
+            # Copy directly to the root with the correct name
+            cp -f ./merged-results/merged_report.html ./report.html
+            echo "✅ report.html saved to repo root"
+        else
+            print_warning "Failed to copy merged_report.html"
+        fi
+    else
+        print_warning "merged_report.html not found in minikube VM"
+    fi
+    
+    # Cleanup section
     print_header "Cleaning up Kubernetes resources"
+    kubectl delete pod/test-merger -n robot-tests --grace-period=0 --force
     kubectl delete -f worker-deployment.yaml -n robot-tests
 fi
 
